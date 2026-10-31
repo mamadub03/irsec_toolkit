@@ -1,28 +1,39 @@
+# ============================================================
 # IRSeC W07 - Windows Firewall Viewer
-# READ ONLY - Windows PowerShell 5.1
+# Windows PowerShell 5.1
+# READ ONLY - Does not modify firewall rules or logging.
+#
 # Usage:
 # .\Windows-FirewallViewer.ps1
 # .\Windows-FirewallViewer.ps1 -Port 23
-# .\Windows-FirewallViewer.ps1 -Port 5985 -Direction Inbound
+# .\Windows-FirewallViewer.ps1 -Port 5985
+# .\Windows-FirewallViewer.ps1 -Port 23 -ShowBroadAllow
+# .\Windows-FirewallViewer.ps1 -Port 23 -ShowDrops
 # .\Windows-FirewallViewer.ps1 -ShowAll
+# ============================================================
 
 #Requires -Version 5.1
 
 [CmdletBinding()]
 param(
-    [ValidateRange(1,65535)]
+    [ValidateRange(0,65535)]
     [int]$Port = 0,
 
     [ValidateSet('Inbound','Outbound','Both')]
-    [string]$Direction = 'Both',
+    [string]$Direction = 'Inbound',
 
-    [switch]$ShowAll
+    [switch]$ShowAll,
+    [switch]$ShowBroadAllow,
+    [switch]$ShowDrops
 )
 
 $ErrorActionPreference = 'Stop'
 
 function Test-PortMatch {
-    param([string]$Specification,[int]$Wanted)
+    param(
+        [string]$Specification,
+        [int]$Wanted
+    )
 
     if ($Wanted -eq 0) { return $true }
 
@@ -30,8 +41,12 @@ function Test-PortMatch {
         $Part = $Part.Trim()
 
         if ($Part -eq 'Any') { return $true }
-        if ($Part -match '^\d+$' -and
-            [int]$Part -eq $Wanted) { return $true }
+
+        if ($Part -match '^\d+$') {
+            if ([int]$Part -eq $Wanted) {
+                return $true
+            }
+        }
 
         if ($Part -match '^(\d+)-(\d+)$') {
             if ($Wanted -ge [int]$Matches[1] -and
@@ -44,130 +59,393 @@ function Test-PortMatch {
     return $false
 }
 
-Write-Host "`n=== WINDOWS FIREWALL STATUS ===" `
-    -ForegroundColor Cyan
+function Test-ExplicitPort {
+    param(
+        [string]$Specification,
+        [int]$Wanted
+    )
 
-Get-NetFirewallProfile |
+    if ($Wanted -eq 0) { return $false }
+    if ($Specification -eq 'Any') { return $false }
+
+    return (Test-PortMatch $Specification $Wanted)
+}
+
+function Show-RuleGroup {
+    param(
+        [string]$Title,
+        [array]$Items
+    )
+
+    Write-Host "`n=== $Title ===" -ForegroundColor Cyan
+
+    if (@($Items).Count -eq 0) {
+        Write-Host 'No matching rules.'
+        return
+    }
+
+    $Items |
+        Select-Object Rule,Action,Direction,Profile,
+            Protocol,LocalPort,RemotePort,RemoteIP,
+            Program,Service |
+        Format-Table -AutoSize -Wrap
+
+    Write-Host "Rules found: $(@($Items).Count)"
+}
+
+function Show-RuleDetails {
+    param([array]$Items)
+
+    if (@($Items).Count -eq 0) { return }
+
+    Write-Host "`n=== MATCHED RULE DETAILS ===" -ForegroundColor Cyan
+
+    $Items |
+        Format-List Rule,Name,Enabled,Action,Direction,
+            Profile,Protocol,LocalPort,RemotePort,
+            LocalIP,RemoteIP,Program,Service,Category
+}
+
+function Show-DroppedPackets {
+    param([int]$RequestedPort)
+
+    Write-Host "`n=== RECENT LOGGED FIREWALL DROPS ===" `
+        -ForegroundColor Cyan
+
+    $Profiles = @(Get-NetFirewallProfile)
+
+    foreach ($Profile in $Profiles) {
+        Write-Host (
+            "$($Profile.Name): " +
+            "DropLogging=$($Profile.LogBlocked); " +
+            "Log=$($Profile.LogFileName)"
+        )
+    }
+
+    $Paths = @(
+        foreach ($Profile in $Profiles) {
+            if ($Profile.LogFileName) {
+                [Environment]::ExpandEnvironmentVariables(
+                    [string]$Profile.LogFileName
+                )
+            }
+        }
+    )
+
+    $Paths += "$env:windir\System32\LogFiles\Firewall\pfirewall.log"
+
+    $Paths = @($Paths | Sort-Object -Unique)
+    $Drops = @()
+
+    foreach ($Path in $Paths) {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            continue
+        }
+
+        try {
+            $Lines = @(
+                Get-Content -LiteralPath $Path `
+                    -Tail 2000 -ErrorAction Stop
+            )
+
+            # Windows Firewall logs declare their field order.
+            $Fields = @()
+
+            foreach ($Line in $Lines) {
+                if ($Line -match '^#Fields:\s*(.*)$') {
+                    $Fields = @(
+                        $Matches[1].Trim() -split '\s+'
+                    )
+                    continue
+                }
+
+                if ($Line -match '^#' -or
+                    [string]::IsNullOrWhiteSpace($Line)) {
+                    continue
+                }
+
+                if ($Fields.Count -eq 0) { continue }
+
+                $Values = @($Line.Trim() -split '\s+')
+
+                if ($Values.Count -lt $Fields.Count) {
+                    continue
+                }
+
+                $Record = @{}
+
+                for ($i = 0; $i -lt $Fields.Count; $i++) {
+                    $Record[$Fields[$i]] = $Values[$i]
+                }
+
+                if ($Record['action'] -ne 'DROP') {
+                    continue
+                }
+
+                if ($RequestedPort -gt 0) {
+                    if ($Record['dst-port'] -ne "$RequestedPort" -and
+                        $Record['src-port'] -ne "$RequestedPort") {
+                        continue
+                    }
+                }
+
+                $Drops += [pscustomobject]@{
+                    Date = $Record['date']
+                    Time = $Record['time']
+                    Protocol = $Record['protocol']
+                    SourceIP = $Record['src-ip']
+                    SourcePort = $Record['src-port']
+                    DestinationIP = $Record['dst-ip']
+                    DestinationPort = $Record['dst-port']
+                    Action = $Record['action']
+                }
+            }
+        }
+        catch {
+            Write-Warning "Could not read ${Path}: $($_.Exception.Message)"
+        }
+    }
+
+    if ($Drops.Count -gt 0) {
+        $Drops |
+            Select-Object -Last 30 |
+            Format-Table -AutoSize -Wrap
+    }
+    else {
+        Write-Host 'No matching DROP records found in readable logs.'
+        Write-Host 'Logging may be disabled or traffic may not have been logged.'
+    }
+
+    Write-Host 'No firewall logging settings were changed.'
+}
+
+# ============================================================
+# FIREWALL PROFILES
+# ============================================================
+
+Write-Host "`n========================================" `
+    -ForegroundColor Cyan
+Write-Host "       IRSeC WINDOWS FIREWALL VIEWER"
+Write-Host "========================================"
+Write-Host "Host: $env:COMPUTERNAME"
+Write-Host "Port: $(if ($Port) { $Port } else { 'ALL' })"
+Write-Host "Direction: $Direction"
+Write-Host "Mode: READ ONLY"
+
+Write-Host "`n=== FIREWALL PROFILES ===" -ForegroundColor Cyan
+
+$Profiles = @(Get-NetFirewallProfile)
+
+$Profiles |
     Select-Object Name,Enabled,DefaultInboundAction,
         DefaultOutboundAction,AllowInboundRules,
         AllowLocalFirewallRules |
     Format-Table -AutoSize
 
-Write-Host "`n=== NETWORK PROFILES ===" -ForegroundColor Cyan
+Write-Host "`n=== ACTIVE NETWORK PROFILES ===" `
+    -ForegroundColor Cyan
 
 Get-NetConnectionProfile |
     Select-Object InterfaceAlias,NetworkCategory,
         IPv4Connectivity |
     Format-Table -AutoSize
 
-Write-Host "`n=== FIREWALL RULES ===" -ForegroundColor Cyan
+# ============================================================
+# COLLECT FIREWALL RULES
+# ============================================================
+
+Write-Host "`nCollecting firewall rules..."
 
 $Rules = @(
     Get-NetFirewallRule -PolicyStore ActiveStore |
     Where-Object {
-        ($ShowAll -or $_.Enabled -eq 'True') -and
+        ($ShowAll -or [string]$_.Enabled -eq 'True') -and
         ($Direction -eq 'Both' -or
          [string]$_.Direction -eq $Direction)
     }
 )
 
-$Rows = foreach ($Rule in $Rules) {
+$Rows = @(
+    foreach ($Rule in $Rules) {
+        try {
+            $PF = $Rule | Get-NetFirewallPortFilter
+            $AF = $Rule | Get-NetFirewallAddressFilter
+            $App = $Rule | Get-NetFirewallApplicationFilter
+            $Svc = $Rule | Get-NetFirewallServiceFilter
 
-    try {
-        $PF = $Rule | Get-NetFirewallPortFilter
-        $AF = $Rule | Get-NetFirewallAddressFilter
-        $App = $Rule | Get-NetFirewallApplicationFilter
-        $Svc = $Rule | Get-NetFirewallServiceFilter
+            $LocalPort = [string]($PF.LocalPort -join ',')
+            $RemotePort = [string]($PF.RemotePort -join ',')
+            $Protocol = [string]$PF.Protocol
 
-        $LocalPort = [string]$PF.LocalPort
-        $RemotePort = [string]$PF.RemotePort
-        $Protocol = [string]$PF.Protocol
-
-        if ($Port -gt 0) {
-            # Inbound traffic generally targets LocalPort.
-            # Outbound traffic generally targets RemotePort.
-            $RelevantPort = if ($Rule.Direction -eq 'Inbound') {
-                $LocalPort
-            } else {
-                $RemotePort
+            if ([string]::IsNullOrWhiteSpace($LocalPort)) {
+                $LocalPort = 'Any'
             }
 
-            if (-not (Test-PortMatch $RelevantPort $Port)) {
-                continue
+            if ([string]::IsNullOrWhiteSpace($RemotePort)) {
+                $RemotePort = 'Any'
             }
 
-            if ($Protocol -notin @('TCP','UDP','6','17','Any')) {
-                continue
+            if ($Port -gt 0) {
+                # Inbound checks destination/local port.
+                # Outbound checks destination/remote port.
+                $RelevantPort = if (
+                    [string]$Rule.Direction -eq 'Inbound'
+                ) {
+                    $LocalPort
+                }
+                else {
+                    $RemotePort
+                }
+
+                if (-not (Test-PortMatch $RelevantPort $Port)) {
+                    continue
+                }
+
+                # TCP investigation; rules for another
+                # protocol are not included.
+                if ($Protocol -notin @('TCP','6','Any')) {
+                    continue
+                }
+            }
+            else {
+                $RelevantPort = 'Any'
+            }
+
+            $Category = 'GENERAL'
+
+            if ($Port -gt 0) {
+                if (Test-ExplicitPort $RelevantPort $Port) {
+                    $Category = 'EXPLICIT_PORT'
+                }
+                elseif ([string]$Rule.Action -eq 'Block') {
+                    $Category = 'BROAD_BLOCK'
+                }
+                else {
+                    $Category = 'BROAD_ALLOW'
+                }
+            }
+
+            [pscustomobject]@{
+                Rule = $Rule.DisplayName
+                Name = $Rule.Name
+                Enabled = [string]$Rule.Enabled
+                Action = [string]$Rule.Action
+                Direction = [string]$Rule.Direction
+                Profile = [string]$Rule.Profile
+                Protocol = $Protocol
+                LocalPort = $LocalPort
+                RemotePort = $RemotePort
+                LocalIP = [string]($AF.LocalAddress -join ',')
+                RemoteIP = [string]($AF.RemoteAddress -join ',')
+                Program = [string]$App.Program
+                Service = [string]$Svc.Service
+                Category = $Category
             }
         }
-
-        [pscustomobject]@{
-            Rule = $Rule.DisplayName
-            Action = [string]$Rule.Action
-            Direction = [string]$Rule.Direction
-            Enabled = [string]$Rule.Enabled
-            Profile = [string]$Rule.Profile
-            Protocol = $Protocol
-            LocalPort = $LocalPort
-            RemotePort = $RemotePort
-            RemoteIP = [string]($AF.RemoteAddress -join ',')
-            LocalIP = [string]($AF.LocalAddress -join ',')
-            Program = [string]$App.Program
-            Service = [string]$Svc.Service
-            Name = $Rule.Name
+        catch {
+            Write-Warning "Could not inspect $($Rule.Name)"
         }
     }
-    catch {
-        Write-Warning "Could not inspect rule $($Rule.Name)"
-    }
-}
+)
 
-$Rows = @($Rows | Sort-Object Action,Direction,Rule)
+# ============================================================
+# DISPLAY RULES
+# ============================================================
 
-if ($Rows.Count) {
-
-    $Rows |
-        Select-Object Rule,Action,Direction,Profile,
-            Protocol,LocalPort,RemotePort,RemoteIP |
-        Format-Table -Wrap -AutoSize
-
-    Write-Host "`n=== RULE DETAILS ===" -ForegroundColor Cyan
-
-    $Rows |
-        Format-List Rule,Action,Direction,Enabled,Profile,
-            Protocol,LocalPort,RemotePort,LocalIP,RemoteIP,
-            Program,Service,Name
+if ($Port -eq 0) {
+    Show-RuleGroup 'ALL MATCHING FIREWALL RULES' $Rows
 }
 else {
-    Write-Host 'No matching rules found.'
-}
+    $Explicit = @(
+        $Rows | Where-Object Category -eq 'EXPLICIT_PORT'
+    )
 
-if ($Port -gt 0) {
-    Write-Host "`n=== LOCAL TCP LISTENER ===" `
+    $BroadBlocks = @(
+        $Rows | Where-Object Category -eq 'BROAD_BLOCK'
+    )
+
+    $BroadAllows = @(
+        $Rows | Where-Object Category -eq 'BROAD_ALLOW'
+    )
+
+    Show-RuleGroup "EXPLICIT TCP $Port RULES" $Explicit
+
+    Show-RuleGroup "BROAD BLOCK RULES THAT MAY AFFECT TCP $Port" `
+        $BroadBlocks
+
+    if ($ShowBroadAllow) {
+        Show-RuleGroup 'BROAD ALLOW RULES' $BroadAllows
+    }
+    else {
+        Write-Host "`nBroad allow rules hidden: $($BroadAllows.Count)"
+        Write-Host 'Use -ShowBroadAllow to display them.'
+    }
+
+    $VisibleRows = @($Explicit) + @($BroadBlocks)
+
+    if ($ShowBroadAllow) {
+        $VisibleRows += @($BroadAllows)
+    }
+
+    Show-RuleDetails $VisibleRows
+
+    # ========================================================
+    # LOCAL TCP LISTENER AND PROCESS
+    # ========================================================
+
+    Write-Host "`n=== LOCAL TCP $Port LISTENER ===" `
         -ForegroundColor Cyan
 
     $Listeners = @(
-        Get-NetTCPConnection -State Listen -LocalPort $Port `
-            -ErrorAction SilentlyContinue
+        Get-NetTCPConnection -State Listen `
+            -LocalPort $Port -ErrorAction SilentlyContinue
     )
 
-    if ($Listeners.Count) {
-        $Listeners |
-            Select-Object LocalAddress,LocalPort,OwningProcess |
-            Format-Table -AutoSize
+    if ($Listeners.Count -gt 0) {
+        $ListenerRows = foreach ($Listener in $Listeners) {
+            $ProcessName = 'Unknown'
+
+            try {
+                $P = Get-Process -Id $Listener.OwningProcess `
+                    -ErrorAction Stop
+                $ProcessName = $P.ProcessName
+            }
+            catch {}
+
+            [pscustomobject]@{
+                LocalAddress = $Listener.LocalAddress
+                LocalPort = $Listener.LocalPort
+                PID = $Listener.OwningProcess
+                Process = $ProcessName
+            }
+        }
+
+        $ListenerRows | Format-Table -AutoSize
     }
     else {
-        Write-Warning "No TCP listener found on port $Port."
+        Write-Warning "No local TCP $Port listener detected."
     }
 
-    Write-Host "`n=== POSSIBLE TROUBLESHOOTING ==="
-    Write-Host '1. Check the active firewall profile.'
-    Write-Host '2. Review enabled Block rules.'
-    Write-Host '3. Compare source IP and rule scope.'
-    Write-Host '4. Check whether the process listens on the LAN IP.'
-    Write-Host '5. If local access works, inspect pfSense and test remotely.'
+    Write-Host "`n=== TROUBLESHOOTING SUGGESTIONS ===" `
+        -ForegroundColor Yellow
+
+    Write-Host '1. Check which firewall profile is active.'
+    Write-Host '2. Review explicit port rules first.'
+    Write-Host '3. Inspect broad blocks and their RemoteIP scope.'
+    Write-Host '4. Check Program and Service restrictions.'
+    Write-Host '5. Verify the listener binds to the expected LAN IP.'
+    Write-Host '6. If local checks pass, test remotely and inspect pfSense.'
 }
 
-Write-Host "`nRead-only inspection complete."
-Write-Warning 'A matching rule does not prove traffic is permitted or denied.'
-Write-Warning 'Rule priority, scope, profile, GPO, and IPsec can affect the result.'
+# ============================================================
+# OPTIONAL DROP LOGS
+# ============================================================
+
+if ($ShowDrops) {
+    Show-DroppedPackets $Port
+}
+
+Write-Host "`n=== COMPLETED ===" -ForegroundColor Green
+Write-Host 'No firewall settings were modified.'
+Write-Warning 'Matching rules are candidates, not proof of a block.'
+Write-Warning 'Profile, scope, application, rule precedence, GPO and IPsec matter.'
