@@ -1,96 +1,111 @@
-#!/usr/bin/env bash
-# IRSeC 2026 - L04 Linux Service Health
-# READ ONLY
-# Debian 12 / Ubuntu 22.04 / Ubuntu 24.04 / Rocky Linux 9
-#
-# Usage:
-# sudo bash Linux-ServiceHealth.sh
-# sudo bash Linux-ServiceHealth.sh pitlane
-# sudo bash Linux-ServiceHealth.sh grandstand /opt/irc
+                    else
+                        report FAIL "Container $name" "$status" \
+                            "Inspect docker logs and the Compose project."
+                    fi
 
-set -uo pipefail
+                    [[ -n "$ports" ]] && \
+                        report INFO "$name ports" "$ports"
+                done <<< "$containers"
+            fi
 
-ROLE="${1:-$(hostname -s)}"
-ROLE="${ROLE,,}"
-COMPOSE_DIR="${2:-}"
+            if [[ -n "$COMPOSE_DIR" ]]; then
+                if [[ -d "$COMPOSE_DIR" ]] &&
+                    docker compose version >/dev/null 2>&1; then
 
-PASS=0
-WARN=0
-FAIL=0
-INFO=0
+                    echo
+                    echo "=== COMPOSE PROJECT ==="
 
-declare -a PROBLEMS=()
+                    (
+                        cd "$COMPOSE_DIR" &&
+                        docker compose ps
+                    ) 2>/dev/null || \
+                        report WARN "Compose project" \
+                            "Unable to list project containers" \
+                            "Inspect the Compose path and project definition."
+                else
+                    report WARN "Compose project" \
+                        "Directory or Compose plugin unavailable"
+                fi
+            else
+                report INFO "Compose project" \
+                    "No project path supplied; container inventory only"
+            fi
+        fi
 
-report() {
-    local status="$1"
-    local component="$2"
-    local detail="$3"
-    local suggestion="${4:-}"
+        report INFO "IRC functionality" \
+            "IRC protocol and bot connection not automatically verified" \
+            "Inspect IRC listener, bot logs, and Hermes scoring."
+        ;;
 
-    printf '[%-4s] %-26s %s\n' \
-        "$status" "$component" "$detail"
+# ------------------------------------------------------------
+# MariaDB - scrutineering
+# ------------------------------------------------------------
 
-    case "$status" in
-        PASS) ((PASS+=1)) ;;
-        WARN) ((WARN+=1)) ;;
-        FAIL) ((FAIL+=1)) ;;
-        INFO) ((INFO+=1)) ;;
-    esac
+    scrutineering)
+        check_any_service "MariaDB daemon" mariadb mysqld
 
-    if [[ "$status" == FAIL || "$status" == WARN ]]; then
-        PROBLEMS+=("$status|$component|$detail|$suggestion")
-    fi
-}
+        check_port 3306 "MariaDB listener"
+        check_tcp_response 3306 "MariaDB TCP response"
 
-check_service() {
-    local unit="$1"
-    local label="$2"
+        if command -v mariadb-admin >/dev/null 2>&1; then
+            if timeout 3 mariadb-admin ping \
+                --protocol=socket >/dev/null 2>&1; then
+                report PASS "MariaDB ping" "Local server responded"
+            else
+                report WARN "MariaDB ping" "Socket ping unavailable/failed" \
+                    "Inspect server socket, credentials, and logs."
+            fi
+        elif command -v mysqladmin >/dev/null 2>&1; then
+            if timeout 3 mysqladmin ping \
+                --protocol=socket >/dev/null 2>&1; then
+                report PASS "MariaDB ping" "Local server responded"
+            else
+                report WARN "MariaDB ping" "Socket ping unavailable/failed" \
+                    "Inspect server socket, credentials, and logs."
+            fi
+        fi
 
-    if ! command -v systemctl >/dev/null 2>&1; then
-        report WARN "$label" "systemctl unavailable" \
-            "Identify the service manager."
-        return
-    fi
+        report INFO "Database queries" \
+            "Authenticated SQL query not tested" \
+            "Verify approved database credentials and Hermes scoring."
+        ;;
 
-    local load active
-    load="$(systemctl show "$unit" -p LoadState --value 2>/dev/null)"
-    active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    *)
+        echo "Unknown host profile: $ROLE"
+        echo "Valid profiles: pitlane, garage, grandstand, scrutineering"
+        exit 1
+        ;;
+esac
 
-    if [[ "$load" == not-found || -z "$load" ]]; then
-        report WARN "$label" "$unit not installed/found" \
-            "Check whether the service uses another unit name."
-    elif [[ "$active" == active ]]; then
-        report PASS "$label" "$unit running"
-    else
-        report FAIL "$label" "$unit status: $active" \
-            "Inspect: systemctl status $unit; journalctl -u $unit -n 30"
-    fi
-}
+# ------------------------------------------------------------
+# Final summary and troubleshooting recommendations
+# ------------------------------------------------------------
 
-check_any_service() {
-    local label="$1"
-    shift
+echo
+echo "========================================"
+echo "               SUMMARY"
+echo "========================================"
+printf 'PASS: %d | WARN: %d | FAIL: %d | INFO: %d\n' \
+    "$PASS" "$WARN" "$FAIL" "$INFO"
 
-    local unit
-    for unit in "$@"; do
-        local load
-        load="$(systemctl show "$unit" -p LoadState --value 2>/dev/null)"
+echo
+echo "=== SUGGESTED INVESTIGATIONS ==="
 
-        if [[ "$load" != not-found && -n "$load" ]]; then
-            check_service "$unit" "$label"
-            return
+if (( ${#PROBLEMS[@]} == 0 )); then
+    echo "No obvious failures detected by the configured checks."
+else
+    for problem in "${PROBLEMS[@]}"; do
+        IFS='|' read -r status component detail suggestion \
+            <<< "$problem"
+
+        echo "[$status] $component"
+        echo "  $detail"
+
+        if [[ -n "$suggestion" ]]; then
+            echo "  Suggestion: $suggestion"
         fi
     done
+fi
 
-    report WARN "$label" "No expected service unit detected" \
-        "Identify installed daemon and its systemd unit."
-}
-
-# SSH can be served by a running daemon OR by systemd socket activation.
-# An inactive ssh.service is normal when ssh.socket is active and listening.
-check_ssh_activation() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        report WARN "SSH activation" "systemctl unavailable" \
-            "Inspect the SSH daemon and TCP 22 listener manually."
-        return
-    fi
+echo
+echo "Read-only checks complete. No changes made."
